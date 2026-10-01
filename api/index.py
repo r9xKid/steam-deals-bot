@@ -1,5 +1,7 @@
 import os
 import json
+import re
+import html
 import requests
 from http.server import BaseHTTPRequestHandler
 
@@ -22,10 +24,6 @@ HEADERS = {
 
 
 def steam_search():
-    """
-    دریافت بازی‌های تخفیف‌خورده از Steam Store.
-    """
-
     params = {
         "start": 0,
         "count": 50,
@@ -44,17 +42,58 @@ def steam_search():
         timeout=25,
     )
 
-    return {
-        "status_code": response.status_code,
-        "url": response.url,
-        "content_type": response.headers.get("content-type"),
-        "text": response.text[:5000],
-    }
+    response.raise_for_status()
+
+    return response.json()
+
+
+def extract_games(search_response):
+    """
+    استخراج AppID و نام بازی‌ها از results_html
+    """
+
+    results_html = search_response.get("results_html", "")
+
+    if not results_html:
+        return []
+
+    games = []
+
+    # هر ردیف بازی یک data-ds-appid دارد
+    pattern = re.compile(
+        r'data-ds-appid="(\d+)"'
+        r'.*?'
+        r'<span class="title">(.*?)</span>',
+        re.S
+    )
+
+    matches = pattern.findall(results_html)
+
+    for appid, raw_name in matches:
+
+        name = html.unescape(
+            re.sub(r"<.*?>", "", raw_name)
+        ).strip()
+
+        if not name:
+            continue
+
+        games.append({
+            "appid": appid,
+            "name": name,
+        })
+
+    # حذف موارد تکراری
+    unique = {}
+    for game in games:
+        unique[game["appid"]] = game
+
+    return list(unique.values())
 
 
 def get_game_details(appid, country):
     """
-    دریافت قیمت یک بازی در یک ریجن مشخص.
+    دریافت قیمت بازی در یک کشور/ریجن.
     """
 
     params = {
@@ -64,42 +103,45 @@ def get_game_details(appid, country):
         "filters": "price_overview",
     }
 
-    response = requests.get(
-        STEAM_DETAILS_URL,
-        params=params,
-        headers=HEADERS,
-        timeout=20,
-    )
-
-    if response.status_code != 200:
-        return None
-
     try:
+
+        response = requests.get(
+            STEAM_DETAILS_URL,
+            params=params,
+            headers=HEADERS,
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            return None
+
         data = response.json()
+
+        game = data.get(str(appid), {})
+
+        if not game.get("success"):
+            return None
+
+        game_data = game.get("data", {})
+
+        return game_data.get("price_overview")
+
     except Exception:
         return None
 
-    game = data.get(str(appid), {})
-
-    if not game.get("success"):
-        return None
-
-    game_data = game.get("data", {})
-
-    return game_data.get("price_overview")
-
 
 def format_price(price):
+
     if not price:
         return "ناموجود"
 
-    return price.get("final_formatted", "ناموجود")
+    return price.get(
+        "final_formatted",
+        "ناموجود"
+    )
 
 
 def send_telegram(message):
-    """
-    ارسال پیام به کانال تلگرام.
-    """
 
     if not BOT_TOKEN:
         return {
@@ -107,92 +149,85 @@ def send_telegram(message):
             "error": "TELEGRAM_BOT_TOKEN is missing"
         }
 
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-
-    response = requests.post(
-        url,
-        json={
-            "chat_id": CHANNEL,
-            "text": message,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=20,
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{BOT_TOKEN}/sendMessage"
     )
 
     try:
+
+        response = requests.post(
+            url,
+            json={
+                "chat_id": CHANNEL,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=20,
+        )
+
         return response.json()
-    except Exception:
+
+    except Exception as e:
+
         return {
             "ok": False,
-            "error": response.text[:1000]
+            "error": str(e)
         }
 
 
-def extract_items(search_data):
-    """
-    تبدیل پاسخ Steam Search به لیست بازی‌ها.
-    """
-
-    try:
-        raw_text = search_data.get("text", "")
-
-        data = json.loads(raw_text)
-
-        items = data.get("items", [])
-
-        if isinstance(items, list):
-            return items
-
-    except Exception:
-        pass
-
-    return []
-
-
 def get_deals():
-    """
-    دریافت تخفیف‌های واقعی.
-    """
 
-    search_data = steam_search()
+    search_response = steam_search()
 
-    items = extract_items(search_data)
+    games = extract_games(
+        search_response
+    )
 
     deals = []
 
-    for item in items:
+    # فعلاً فقط 10 بازی برای تست
+    for game in games[:10]:
 
-        appid = (
-            item.get("id")
-            or item.get("appid")
-            or item.get("appID")
+        appid = game["appid"]
+
+        us = get_game_details(
+            appid,
+            "US"
         )
-
-        if not appid:
-            continue
-
-        name = item.get("name", "Unknown")
-
-        us = get_game_details(appid, "US")
 
         if not us:
             continue
 
         discount = int(
-            us.get("discount_percent", 0)
+            us.get(
+                "discount_percent",
+                0
+            )
         )
 
         if discount <= 0:
             continue
 
-        eu = get_game_details(appid, "DE")
-        india = get_game_details(appid, "IN")
-        ukraine = get_game_details(appid, "UA")
+        eu = get_game_details(
+            appid,
+            "DE"
+        )
+
+        india = get_game_details(
+            appid,
+            "IN"
+        )
+
+        ukraine = get_game_details(
+            appid,
+            "UA"
+        )
 
         deals.append({
             "appid": appid,
-            "name": name,
+            "name": game["name"],
             "discount": discount,
             "us": us,
             "eu": eu,
@@ -207,16 +242,16 @@ def make_message(game):
 
     appid = game["appid"]
 
-    name = game["name"]
-    discount = game["discount"]
-
     steam_link = (
-        f"https://store.steampowered.com/app/{appid}/"
+        f"https://store.steampowered.com/app/"
+        f"{appid}/"
     )
 
     return (
-        f"🔥 <b>{name}</b>\n\n"
-        f"🏷 تخفیف: <b>{discount}%</b>\n\n"
+        f"🔥 <b>{game['name']}</b>\n\n"
+
+        f"🏷 تخفیف: "
+        f"<b>{game['discount']}%</b>\n\n"
 
         f"🇺🇸 آمریکا: "
         f"{format_price(game['us'])}\n"
@@ -242,19 +277,19 @@ class handler(BaseHTTPRequestHandler):
         body = json.dumps(
             data,
             ensure_ascii=False,
-            indent=2,
+            indent=2
         ).encode("utf-8")
 
         self.send_response(200)
 
         self.send_header(
             "Content-Type",
-            "application/json; charset=utf-8",
+            "application/json; charset=utf-8"
         )
 
         self.send_header(
             "Content-Length",
-            str(len(body)),
+            str(len(body))
         )
 
         self.end_headers()
@@ -265,25 +300,24 @@ class handler(BaseHTTPRequestHandler):
 
         try:
 
-            search_data = steam_search()
+            search_response = steam_search()
 
-            items = extract_items(search_data)
+            games = extract_games(
+                search_response
+            )
 
             self.send_json({
                 "success": True,
-                "steam_status": search_data["status_code"],
-                "steam_content_type": search_data["content_type"],
-                "items_found": len(items),
-                "steam_url": search_data["url"],
-                "sample_items": items[:5],
-                "raw_response_start": search_data["text"][:2000],
+                "steam_status": 200,
+                "games_found": len(games),
+                "games": games[:20],
             })
 
         except Exception as e:
 
             self.send_json({
                 "success": False,
-                "error": str(e),
+                "error": str(e)
             })
 
     def do_POST(self):
@@ -295,19 +329,23 @@ class handler(BaseHTTPRequestHandler):
             sent = 0
             errors = []
 
-            # فعلاً فقط 5 بازی برای تست
+            # فقط 5 پست برای تست
             for game in deals[:5]:
 
-                message = make_message(game)
+                message = make_message(
+                    game
+                )
 
-                result = send_telegram(message)
+                result = send_telegram(
+                    message
+                )
 
                 if result.get("ok"):
                     sent += 1
                 else:
                     errors.append({
                         "appid": game["appid"],
-                        "telegram": result,
+                        "telegram": result
                     })
 
             self.send_json({
@@ -322,5 +360,5 @@ class handler(BaseHTTPRequestHandler):
 
             self.send_json({
                 "success": False,
-                "error": str(e),
+                "error": str(e)
             })
