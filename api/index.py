@@ -22,6 +22,29 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+REGIONS = {
+    "us": {
+        "country": "US",
+        "flag": "🇺🇸",
+        "name": "آمریکا",
+    },
+    "eu": {
+        "country": "DE",
+        "flag": "🇪🇺",
+        "name": "اروپا",
+    },
+    "india": {
+        "country": "IN",
+        "flag": "🇮🇳",
+        "name": "هند",
+    },
+    "ukraine": {
+        "country": "UA",
+        "flag": "🇺🇦",
+        "name": "اوکراین",
+    },
+}
+
 
 def steam_search():
     params = {
@@ -48,10 +71,6 @@ def steam_search():
 
 
 def extract_games(search_response):
-    """
-    استخراج AppID و نام بازی‌ها از results_html
-    """
-
     results_html = search_response.get("results_html", "")
 
     if not results_html:
@@ -59,7 +78,6 @@ def extract_games(search_response):
 
     games = []
 
-    # هر ردیف بازی یک data-ds-appid دارد
     pattern = re.compile(
         r'data-ds-appid="(\d+)"'
         r'.*?'
@@ -83,8 +101,8 @@ def extract_games(search_response):
             "name": name,
         })
 
-    # حذف موارد تکراری
     unique = {}
+
     for game in games:
         unique[game["appid"]] = game
 
@@ -92,9 +110,6 @@ def extract_games(search_response):
 
 
 def get_game_details(appid, country):
-    """
-    دریافت قیمت بازی در یک کشور/ریجن.
-    """
 
     params = {
         "appids": str(appid),
@@ -130,15 +145,58 @@ def get_game_details(appid, country):
         return None
 
 
-def format_price(price):
+def escape_html(text):
+
+    if text is None:
+        return ""
+
+    return html.escape(
+        str(text),
+        quote=False
+    )
+
+
+def format_region_price(price):
 
     if not price:
         return "ناموجود"
 
-    return price.get(
-        "final_formatted",
-        "ناموجود"
+    initial = price.get("initial_formatted")
+    final = price.get("final_formatted")
+
+    if not final:
+        return "ناموجود"
+
+    discount = int(
+        price.get(
+            "discount_percent",
+            0
+        )
     )
+
+    if discount > 0 and initial:
+
+        return (
+            f"<s>{escape_html(initial)}</s>"
+            f" → "
+            f"<b>{escape_html(final)}</b>"
+        )
+
+    return f"<b>{escape_html(final)}</b>"
+
+
+def get_region_prices(appid):
+
+    prices = {}
+
+    for key, region in REGIONS.items():
+
+        prices[key] = get_game_details(
+            appid,
+            region["country"]
+        )
+
+    return prices
 
 
 def send_telegram(message):
@@ -210,29 +268,15 @@ def get_deals():
         if discount <= 0:
             continue
 
-        eu = get_game_details(
-            appid,
-            "DE"
-        )
-
-        india = get_game_details(
-            appid,
-            "IN"
-        )
-
-        ukraine = get_game_details(
-            appid,
-            "UA"
+        prices = get_region_prices(
+            appid
         )
 
         deals.append({
             "appid": appid,
             "name": game["name"],
             "discount": discount,
-            "us": us,
-            "eu": eu,
-            "india": india,
-            "ukraine": ukraine,
+            "prices": prices,
         })
 
     return deals
@@ -247,23 +291,37 @@ def make_message(game):
         f"{appid}/"
     )
 
+    prices = game.get(
+        "prices",
+        {}
+    )
+
+    us = prices.get("us")
+    eu = prices.get("eu")
+    india = prices.get("india")
+    ukraine = prices.get("ukraine")
+
+    name = escape_html(
+        game["name"]
+    )
+
     return (
-        f"🔥 <b>{game['name']}</b>\n\n"
+        f"🔥 <b>{name}</b>\n\n"
 
         f"🏷 تخفیف: "
         f"<b>{game['discount']}%</b>\n\n"
 
         f"🇺🇸 آمریکا: "
-        f"{format_price(game['us'])}\n"
+        f"{format_region_price(us)}\n"
 
         f"🇪🇺 اروپا: "
-        f"{format_price(game['eu'])}\n"
+        f"{format_region_price(eu)}\n"
 
         f"🇮🇳 هند: "
-        f"{format_price(game['india'])}\n"
+        f"{format_region_price(india)}\n"
 
         f"🇺🇦 اوکراین: "
-        f"{format_price(game['ukraine'])}\n\n"
+        f"{format_region_price(ukraine)}\n\n"
 
         f"🛒 <a href=\"{steam_link}\">"
         f"مشاهده در Steam</a>"
@@ -329,7 +387,7 @@ class handler(BaseHTTPRequestHandler):
             sent = 0
             errors = []
 
-            # فقط 5 پست برای تست
+            # فعلاً فقط 5 پست برای تست
             for game in deals[:5]:
 
                 message = make_message(
